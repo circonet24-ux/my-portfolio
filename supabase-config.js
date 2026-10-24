@@ -11,8 +11,8 @@
   anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9....'
 */
 window.ATHARI_SUPABASE = {
-  // ضع Project URL هنا
-  url: '',
-  // ضع anon public key هنا (أو publishable key)
-  anonKey: ''
+  // Project URL
+  url: 'https://frinastobmdhjgrhsubf.supabase.co',
+  // Publishable key (public)
+  anonKey: 'sb_publishable_txDCHn-wEi-6FoQGeEnX-Q_UwB7AsCm'
 };
