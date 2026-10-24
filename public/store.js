@@ -424,7 +424,7 @@
 
   async function logout() {
     if (!client) return true;
-    const { error } = await client.auth.signOut();
+    const { error } = await client.auth.signOut({ scope: 'local' });
     if (error) throwAuth(error);
     return true;
   }
