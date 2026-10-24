@@ -1,6 +1,6 @@
 /* ==========================================================================
    أثري — ملف إنجازي الرقمي
-   تطبيق واجهة يعمل بالكامل بقاعدة بيانات المتصفح المحلية (localStorage)
+   تطبيق واجهة يعمل مع Supabase Auth وقاعدة بيانات سحابية محمية بـ RLS
    ========================================================================== */
 (function () {
   'use strict';
@@ -105,6 +105,7 @@
   };
 
   let modalSequence = 0;
+  let isLoggingOut = false;
   const modalStack = [];
 
   const $ = (selector, root = document) => root.querySelector(selector);
@@ -133,7 +134,12 @@
 
   function uid() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') return window.crypto.randomUUID();
-    return Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
   function normalizeArabic(value) {
@@ -460,6 +466,17 @@
     top.close(false);
   }
 
+  function closeAllModals() {
+    while (modalStack.length) {
+      try {
+        modalStack[modalStack.length - 1].close(false);
+      } catch {
+        modalStack.pop();
+      }
+    }
+    document.body.classList.remove('modal-open');
+  }
+
   document.addEventListener('keydown', (event) => {
     if (!modalStack.length) return;
     if (event.key === 'Escape') {
@@ -601,7 +618,7 @@
         <button class="auth-submit" type="submit">تسجيل الدخول ${icon('arrow-left')}</button>
         <div class="auth-local-note">
           ${icon('shield')}
-          <span>مساحتك خاصة بك وحدك. تُحفظ بياناتك محليًا داخل هذا المتصفح، ولا تُرسل إلى أي خادم خارجي.</span>
+          <span>مساحتك خاصة بك وحدك. تتم المصادقة وحفظ البيانات بأمان عبر Supabase، ولا يرى بياناتك أي مستخدم آخر.</span>
         </div>
       </form>
     `;
@@ -645,7 +662,7 @@
         <button class="auth-submit" type="submit">إنشاء المساحة ${icon('arrow-left')}</button>
         <div class="auth-local-note">
           ${icon('database')}
-          <span>بإنشاء الحساب تُنشأ مساحة مستقلة باسمك. احتفظ ببيانات الدخول؛ فالحساب محلي ولا يمكن استعادته من خادم.</span>
+          <span>بإنشاء الحساب تُنشأ مساحة سحابية مستقلة باسمك. يمكنك الدخول إليها من أي جهاز باستخدام بريدك وكلمة المرور.</span>
         </div>
       </form>
     `;
@@ -700,7 +717,7 @@
             </div>
           </div>
           <div class="auth-hero-foot">
-            <span>${icon('lock')} بيانات محلية خاصة</span>
+            <span>${icon('lock')} بيانات سحابية محمية</span>
             <span>أثري © 2026</span>
           </div>
         </section>
@@ -719,7 +736,7 @@
             ${authModeMarkup(chosenMode)}
             ${isRegister ? registerFormMarkup() : loginFormMarkup()}
           </div>
-          <p class="auth-panel-foot">أثري — ملف إنجازي الرقمي · نسخة محلية تحفظ خصوصيتك</p>
+          <p class="auth-panel-foot">أثري — ملف إنجازي الرقمي · نسخة سحابية آمنة</p>
         </section>
       </div>
     `;
@@ -802,9 +819,13 @@
     const submit = $('button[type="submit"]', form);
     setButtonLoading(submit, true, 'جارٍ التحقق...');
     try {
-      const user = await Store.login({ email, password, remember: true });
-      toast(`أهلًا بعودتك، ${user.name.split(/\s+/)[0]}.`, 'success');
-      enterApp(user);
+      const user = await Store.login({ email, password });
+      await enterApp(user);
+      if (state.user) {
+        toast(`أهلًا بعودتك، ${user.name.split(/\s+/)[0]}.`, 'success');
+      } else {
+        setButtonLoading(submit, false);
+      }
     } catch (error) {
       setButtonLoading(submit, false);
       showAuthError(error.message || 'تعذّر تسجيل الدخول.');
@@ -830,38 +851,62 @@
     const submit = $('button[type="submit"]', form);
     setButtonLoading(submit, true, 'جارٍ إنشاء المساحة...');
     try {
-      const user = await Store.register({ name, email, password });
-      toast('تم إنشاء مساحتك المهنية بنجاح. خطوتك الأولى تبدأ الآن.', 'success');
-      enterApp(user);
+      const result = await Store.register({ name, email, password });
+      if (result.needsConfirmation) {
+        setButtonLoading(submit, false);
+        toast('تم إنشاء الحساب. تحقق من بريدك الإلكتروني لتأكيده ثم سجّل الدخول.', 'info');
+        renderAuth('login');
+        showAuthError('أرسلنا رسالة تأكيد إلى بريدك الإلكتروني. افتح الرابط ثم سجّل الدخول.');
+        return;
+      }
+      await enterApp(result.user);
+      if (state.user) {
+        toast('تم إنشاء مساحتك المهنية بنجاح. خطوتك الأولى تبدأ الآن.', 'success');
+      } else {
+        setButtonLoading(submit, false);
+      }
     } catch (error) {
       setButtonLoading(submit, false);
       showAuthError(error.message || 'تعذّر إنشاء الحساب.');
     }
   }
 
+  let enterPromise = null;
+
   function enterApp(user) {
-    state.user = user;
-    try {
-      state.workspace = Store.getWorkspace(user.id);
-    } catch (error) {
-      toast(error.message || 'تعذّر تحميل المساحة.', 'error');
-      return;
-    }
-    state.profile = state.workspace.profile;
-    document.getElementById('auth-view').hidden = true;
-    document.getElementById('app-view').hidden = false;
-    renderShell();
-    const { name } = parseHash();
-    const firstRoute = VALID_ROUTES.has(name) && name !== 'search' ? name : 'dashboard';
-    if (location.hash && location.hash !== `#${firstRoute}`) {
-      history.replaceState(null, '', `#${firstRoute}`);
-    } else if (!location.hash) {
-      history.replaceState(null, '', `#${firstRoute}`);
-    }
-    state.currentRoute = firstRoute;
-    renderRoute();
-    hideBoot();
-    document.title = `${ROUTE_INFO[firstRoute].title} | أثري`;
+    if (!user) return Promise.resolve(false);
+    if (state.user && state.user.id === user.id && state.workspace) return Promise.resolve(true);
+    if (enterPromise) return enterPromise;
+    enterPromise = (async () => {
+      state.user = user;
+      try {
+        state.workspace = await Store.getWorkspace(user.id);
+      } catch (error) {
+        toast(error.message || 'تعذّر تحميل المساحة.', 'error');
+        state.user = null;
+        state.workspace = null;
+        return false;
+      }
+      state.profile = state.workspace.profile;
+      document.getElementById('auth-view').hidden = true;
+      document.getElementById('app-view').hidden = false;
+      renderShell();
+      const { name } = parseHash();
+      const firstRoute = VALID_ROUTES.has(name) && name !== 'search' ? name : 'dashboard';
+      if (location.hash && location.hash !== `#${firstRoute}`) {
+        history.replaceState(null, '', `#${firstRoute}`);
+      } else if (!location.hash) {
+        history.replaceState(null, '', `#${firstRoute}`);
+      }
+      state.currentRoute = firstRoute;
+      renderRoute();
+      hideBoot();
+      document.title = `${ROUTE_INFO[firstRoute].title} | أثري`;
+      return true;
+    })().finally(() => {
+      enterPromise = null;
+    });
+    return enterPromise;
   }
 
   function hideBoot() {
@@ -904,26 +949,33 @@
     }
   }
 
-  function logout() {
-    confirmDialog({
+  async function logout() {
+    const confirmed = await confirmDialog({
       title: 'تسجيل الخروج؟',
-      message: 'ستعود إلى شاشة الدخول. تبقى بيانات مساحتك محفوظة في هذا المتصفح ويمكنك الدخول إليها لاحقًا.',
+      message: 'ستعود إلى شاشة الدخول. تبقى بيانات مساحتك محفوظة في حسابك السحابي ويمكنك الدخول إليها لاحقًا.',
       confirmLabel: 'تسجيل الخروج',
       iconName: 'logout',
       danger: false,
-    }).then((confirmed) => {
-      if (!confirmed) return;
-      Store.logout();
-      state.user = null;
-      state.workspace = null;
-      state.profile = null;
-      state.currentRoute = 'dashboard';
-      state.filters = {};
-      document.getElementById('app-view').hidden = true;
-      history.replaceState(null, '', window.location.pathname + window.location.search);
-      renderAuth('login');
-      document.title = 'أثري | ملف إنجازي الرقمي';
     });
+    if (!confirmed) return;
+    isLoggingOut = true;
+    try {
+      await Store.logout();
+    } catch (error) {
+      toast(error.message || 'تعذّر تسجيل الخروج من الخادم.', 'error');
+    } finally {
+      isLoggingOut = false;
+    }
+    closeAllModals();
+    state.user = null;
+    state.workspace = null;
+    state.profile = null;
+    state.currentRoute = 'dashboard';
+    state.filters = {};
+    document.getElementById('app-view').hidden = true;
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    renderAuth('login');
+    document.title = 'أثري | ملف إنجازي الرقمي';
   }
 
   /* ------------------------------------------------------------------ */
@@ -971,7 +1023,7 @@
         <div class="storage-widget" id="storage-widget">
           <div class="storage-widget-head">
             ${icon('database')}
-            <span>مساحة التخزين</span>
+            <span>حجم الملف</span>
             <strong data-storage-text>0%</strong>
           </div>
           <div class="storage-track"><span data-storage-bar></span></div>
@@ -1212,21 +1264,80 @@
     workspace.activity = workspace.activity.slice(0, 60);
   }
 
-  function commitWorkspace(mutator, options = {}) {
+  async function commitWorkspace(mutator, options = {}) {
     if (!state.workspace || !state.user) throw new Error('لا توجد مساحة عمل نشطة.');
-    const snapshot = JSON.stringify(state.workspace);
+    const before = state.workspace;
+    const draft = typeof structuredClone === 'function'
+      ? structuredClone(before)
+      : JSON.parse(JSON.stringify(before));
+    let persisted = false;
     try {
-      mutator(state.workspace);
-      state.workspace.updatedAt = new Date().toISOString();
+      mutator(draft);
+      draft.updatedAt = new Date().toISOString();
       if (options.activity) {
-        pushActivity(state.workspace, options.activity.kind, options.activity.section, options.activity.title);
+        pushActivity(draft, options.activity.kind, options.activity.section, options.activity.title);
       }
-      Store.saveWorkspace(state.user.id, state.workspace);
-      state.profile = state.workspace.profile;
-      if (options.accountName) Store.updateAccountName(state.user.id, options.accountName);
+      const bytes = Store.workspaceBytes(draft);
+      if (bytes > Store.MAX_WORKSPACE_BYTES) {
+        throw new Store.StoreError(
+          'حجم الملف أكبر من الحد المسموح. احذف بعض المرفقات أو صدّر نسخة احتياطية.',
+          'WORKSPACE_LIMIT',
+        );
+      }
+
+      if (JSON.stringify(draft.profile) !== JSON.stringify(before.profile)) {
+        persisted = true;
+        await Store.saveProfile(draft.profile);
+      }
+
+      for (const section of Object.keys(SECTIONS)) {
+        const beforeItems = Array.isArray(before[section]) ? before[section] : [];
+        const afterItems = Array.isArray(draft[section]) ? draft[section] : [];
+        const afterMap = new Map(afterItems.map((item) => [item.id, item]));
+        const beforeMap = new Map(beforeItems.map((item) => [item.id, item]));
+
+        for (const oldItem of beforeItems) {
+          if (!afterMap.has(oldItem.id)) {
+            persisted = true;
+            await Store.deleteItem(section, oldItem.id);
+          }
+        }
+        for (const item of afterItems) {
+          const oldItem = beforeMap.get(item.id);
+          if (!oldItem) {
+            persisted = true;
+            await Store.createItem(section, item);
+          } else if (JSON.stringify(oldItem) !== JSON.stringify(item)) {
+            persisted = true;
+            await Store.updateItem(section, item);
+          }
+        }
+      }
+
+      const beforeActivityIds = new Set((before.activity || []).map((entry) => entry.id));
+      for (const entry of (draft.activity || [])) {
+        if (!beforeActivityIds.has(entry.id)) {
+          persisted = true;
+          await Store.addActivity(entry);
+        }
+      }
+
+      if (options.accountName) {
+        persisted = true;
+        await Store.updateAccountName(options.accountName);
+      }
+
+      state.workspace = draft;
+      state.profile = draft.profile;
     } catch (error) {
-      state.workspace = JSON.parse(snapshot);
-      state.profile = state.workspace.profile;
+      if (persisted && state.user) {
+        try {
+          state.workspace = await Store.getWorkspace(state.user.id);
+          state.profile = state.workspace.profile;
+        } catch {
+          // إبقاء النسخة المحلية الحالية إن تعذّر إعادة التحميل.
+        }
+      }
       throw error;
     }
   }
@@ -1987,35 +2098,34 @@
     void backdrop;
   }
 
-  function deleteItem(section, id) {
+  async function deleteItem(section, id) {
     const item = findItem(section, id);
     if (!item) {
       toast('لم يعد هذا العنصر موجودًا.', 'error');
       return;
     }
     const meta = SECTIONS[section];
-    confirmDialog({
+    const confirmed = await confirmDialog({
       title: `حذف ${meta.singular}؟`,
       message: `سيتم حذف «${item.title || 'بدون عنوان'}» ومرفقاته نهائيًا من مساحتك. لا يمكن التراجع عن هذه العملية.`,
       confirmLabel: 'حذف نهائي',
       iconName: 'trash',
-    }).then((confirmed) => {
-      if (!confirmed) return;
-      try {
-        commitWorkspace((workspace) => {
-          workspace[section] = (workspace[section] || []).filter((entry) => entry.id !== id);
-          if (section === 'achievements') {
-            (workspace.evidence || []).forEach((evidence) => {
-              if (evidence.linkedAchievementId === id) evidence.linkedAchievementId = '';
-            });
-          }
-        }, { activity: { kind: 'deleted', section, title: item.title || '' } });
-        toast(`تم حذف ${meta.singular} من مساحتك.`, 'success');
-        renderRoute();
-      } catch (error) {
-        toast(error.message || 'تعذّر حذف العنصر.', 'error');
-      }
     });
+    if (!confirmed) return;
+    try {
+      await commitWorkspace((workspace) => {
+        workspace[section] = (workspace[section] || []).filter((entry) => entry.id !== id);
+        if (section === 'achievements') {
+          (workspace.evidence || []).forEach((evidence) => {
+            if (evidence.linkedAchievementId === id) evidence.linkedAchievementId = '';
+          });
+        }
+      }, { activity: { kind: 'deleted', section, title: item.title || '' } });
+      toast(`تم حذف ${meta.singular} من مساحتك.`, 'success');
+      renderRoute();
+    } catch (error) {
+      toast(error.message || 'تعذّر حذف العنصر.', 'error');
+    }
   }
 
   /* ------------------------------------------------------------------ */
@@ -2135,13 +2245,13 @@
               <span class="uploading" id="uploading-state" hidden><span class="spinner dark"></span> جارٍ معالجة الملفات...</span>
             </div>
             <div class="attachment-draft-list" id="attachment-draft-list"></div>
-            <div class="storage-hint">${icon('database')} المرفقات تُحفظ داخل مساحة المتصفح. الصور الكبيرة تُضغط تلقائيًا.</div>
+            <div class="storage-hint">${icon('database')} المرفقات تُحفظ في حسابك السحابي. الصور الكبيرة تُضغط تلقائيًا.</div>
           </div>
 
           <div class="form-error span-2" data-form-error hidden></div>
         </div>
         <div class="modal-footer form-footer">
-          <span class="form-actions-note">${icon('lock')} تُحفظ التغييرات محليًا</span>
+          <span class="form-actions-note">${icon('lock')} تُحفظ التغييرات في حسابك</span>
           <button class="btn" type="button" data-form-cancel>إلغاء</button>
           <button class="btn primary" type="submit" data-form-submit>${item.id ? 'حفظ التعديلات' : `حفظ ${escapeHtml(meta.singular)}`}</button>
         </div>
@@ -2196,9 +2306,9 @@
 
         function renderDrafts() {
           if (list) list.innerHTML = draftAttachmentListMarkup(draftAttachments);
-          const localStorageHint = $('.storage-hint', dialog);
-          if (localStorageHint) {
-            localStorageHint.innerHTML = `${icon('database')} ${draftAttachments.length} من ${MAX_FILES_PER_ITEM} مرفقات · تُحفظ داخل مساحة المتصفح`;
+          const storageHint = $('.storage-hint', dialog);
+          if (storageHint) {
+            storageHint.innerHTML = `${icon('database')} ${draftAttachments.length} من ${MAX_FILES_PER_ITEM} مرفقات · تُحفظ في حسابك السحابي`;
           }
         }
 
@@ -2275,7 +2385,7 @@
 
         $('[data-form-cancel]', form).addEventListener('click', () => close(false));
 
-        form.addEventListener('submit', (event) => {
+        form.addEventListener('submit', async (event) => {
           event.preventDefault();
           if (processing) {
             toast('انتظر حتى تنتهي معالجة الملفات.', 'info');
@@ -2321,8 +2431,9 @@
             createdAt: existing?.createdAt || new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
+          setButtonLoading(submitButton, true, 'جارٍ الحفظ...');
           try {
-            commitWorkspace((workspace) => {
+            await commitWorkspace((workspace) => {
               workspace[section] = Array.isArray(workspace[section]) ? workspace[section] : [];
               if (existing) {
                 const index = workspace[section].findIndex((entry) => entry.id === existing.id);
@@ -2605,7 +2716,7 @@
             <div class="form-error span-2" data-form-error hidden></div>
           </div>
           <div class="modal-footer form-footer">
-            <span class="form-actions-note">${icon('lock')} تُحفظ التغييرات محليًا</span>
+            <span class="form-actions-note">${icon('lock')} تُحفظ التغييرات في حسابك</span>
             <button class="btn" type="button" data-form-cancel>إلغاء</button>
             <button class="btn primary" type="submit" data-form-submit>${icon('save')} حفظ الملف</button>
           </div>
@@ -2667,7 +2778,7 @@
 
         $('[data-form-cancel]', form)?.addEventListener('click', () => close(false));
 
-        form.addEventListener('submit', (event) => {
+        form.addEventListener('submit', async (event) => {
           event.preventDefault();
           if (processing) {
             toast('انتظر حتى تنتهي معالجة الصورة.', 'info');
@@ -2728,7 +2839,7 @@
 
           setButtonLoading(submitButton, true, 'جارٍ حفظ الملف...');
           try {
-            commitWorkspace((workspace) => {
+            await commitWorkspace((workspace) => {
               workspace.profile = nextProfile;
             }, {
               activity: { kind: 'profile' },
@@ -2768,7 +2879,7 @@
         <div class="page-heading-main">
           <span class="page-eyebrow">${icon('settings')} الحساب</span>
           <h1 class="page-title">الإعدادات</h1>
-          <p class="page-description">تحكّم في حسابك ومظهر التطبيق ومساحة التخزين، واحتفظ بنسخة احتياطية من ملفك في أي وقت.</p>
+          <p class="page-description">تحكّم في حسابك ومظهر التطبيق وحجم ملفك، واحتفظ بنسخة احتياطية من بياناتك في أي وقت.</p>
         </div>
       </div>
 
@@ -2784,12 +2895,12 @@
               <strong>${escapeHtml(name)}</strong>
               <span dir="ltr">${escapeHtml(email)}</span>
             </div>
-            <span class="badge neutral">${icon('lock')} محلي</span>
+            <span class="badge neutral">${icon('lock')} سحابي</span>
           </div>
           <div class="settings-list">
             <div class="settings-line">${icon('calendar')}<span>عضو منذ</span><strong>${escapeHtml(memberSince)}</strong></div>
             <div class="settings-line">${icon('clock')}<span>آخر دخول</span><strong>${escapeHtml(lastLogin)}</strong></div>
-            <div class="settings-line">${icon('shield')}<span>خصوصية البيانات</span><strong>على هذا المتصفح فقط</strong></div>
+            <div class="settings-line">${icon('shield')}<span>خصوصية البيانات</span><strong>محمية عبر Supabase RLS</strong></div>
           </div>
           <div class="settings-actions">
             <button class="btn sm primary" type="button" data-edit-profile>${icon('edit')} تعديل الملف</button>
@@ -2821,7 +2932,7 @@
         <section class="settings-card" aria-labelledby="settings-storage-title">
           <div class="settings-head">
             <span class="settings-icon">${icon('database')}</span>
-            <div><h2 id="settings-storage-title">مساحة التخزين</h2><p>سعة مساحتك المحلية وحالة استخدامها.</p></div>
+            <div><h2 id="settings-storage-title">حجم الملف</h2><p>حجم بياناتك السحابية وحالة استخدامها.</p></div>
           </div>
           <div class="storage-summary">
             <div class="storage-donut" style="--progress:${storage.percent}">
@@ -2829,22 +2940,22 @@
               <span>مستخدم</span>
             </div>
             <div class="storage-info">
-              <h3>${storage.percent >= 82 ? 'المساحة تقترب من الامتلاء' : 'مساحتك في وضع جيد'}</h3>
-              <p>${formatBytes(storage.bytes)} مستخدمة من أصل ${formatBytes(storage.limit)}. تُحسب المرفقات والصور ضمن هذه المساحة.</p>
+              <h3>${storage.percent >= 82 ? 'حجم الملف يقترب من الحد' : 'حجم ملفك في وضع جيد'}</h3>
+              <p>${formatBytes(storage.bytes)} مستخدمة من أصل ${formatBytes(storage.limit)}. تُحسب المرفقات والصور ضمن هذا الحجم.</p>
               <div class="storage-track"><span style="width:${Math.max(storage.percent, storage.bytes ? 2 : 0)}%"></span></div>
               <small>${storage.percent >= 82 ? 'احذف المرفقات غير الضرورية أو صدّر نسخة احتياطية.' : 'الصور الكبيرة تُضغط تلقائيًا قبل حفظها.'}</small>
             </div>
           </div>
           <div class="info-note">
             ${icon('shield')}
-            <span>التخزين مرتبط بهذا المتصفح وهذا الجهاز. مسح بيانات المتصفح قد يؤدي إلى فقدان المساحة، لذا احتفظ بنسخة احتياطية دوريًا.</span>
+            <span>بياناتك محفوظة في حسابك السحابي ويمكنك الوصول إليها من أي جهاز. احتفظ بنسخة احتياطية دوريًا لمزيد من الأمان.</span>
           </div>
         </section>
 
         <section class="settings-card" aria-labelledby="settings-backup-title">
           <div class="settings-head">
             <span class="settings-icon blue">${icon('save')}</span>
-            <div><h2 id="settings-backup-title">النسخ الاحتياطي</h2><p>صدّر ملفك أو استعده على متصفح آخر.</p></div>
+            <div><h2 id="settings-backup-title">النسخ الاحتياطي</h2><p>صدّر ملفك أو استعده على أي جهاز.</p></div>
           </div>
           <div class="backup-actions">
             <button class="btn sm primary" type="button" data-export-backup>${icon('download')} تصدير نسخة</button>
@@ -2875,7 +2986,7 @@
   function openPasswordModal() {
     const { backdrop, close } = openModal({
       title: 'تغيير كلمة المرور',
-      subtitle: 'اختر كلمة مرور قوية وجديدة لحماية مساحتك المحلية.',
+      subtitle: 'اختر كلمة مرور قوية وجديدة لحماية حسابك.',
       kicker: 'أمان الحساب',
       kickerIcon: 'key',
       size: 'sm',
@@ -2909,7 +3020,7 @@
             <div class="form-error span-2" data-form-error hidden></div>
           </div>
           <div class="modal-footer form-footer">
-            <span class="form-actions-note">${icon('shield')} لا تُرسل كلمة المرور إلى أي خادم</span>
+            <span class="form-actions-note">${icon('shield')} تُعالج كلمة المرور بأمان عبر Supabase Auth</span>
             <button class="btn" type="button" data-form-cancel>إلغاء</button>
             <button class="btn primary" type="submit" data-form-submit>${icon('key')} تحديث كلمة المرور</button>
           </div>
@@ -2960,9 +3071,9 @@
           }
           setButtonLoading(submitButton, true, 'جارٍ تحديث كلمة المرور...');
           try {
-            await Store.changePassword(state.user.id, currentPassword, newPassword);
+            await Store.changePassword(currentPassword, newPassword);
             try {
-              commitWorkspace(() => {}, { activity: { kind: 'password' } });
+              await commitWorkspace(() => {}, { activity: { kind: 'password' } });
             } catch { /* لا تؤثر صعوبة حفظ النشاط في نجاح تغيير كلمة المرور */ }
             close(true);
             toast('تم تحديث كلمة المرور بنجاح.', 'success');
@@ -3359,17 +3470,35 @@
         .filter(Boolean);
     });
 
-    const achievementIds = new Set(workspace.achievements.map((item) => item.id));
-    workspace.evidence.forEach((item) => {
-      if (item.linkedAchievementId && !achievementIds.has(item.linkedAchievementId)) item.linkedAchievementId = '';
+    const idMap = new Map();
+    const usedIds = new Set();
+    Object.keys(SECTIONS).forEach((section) => {
+      workspace[section].forEach((item) => {
+        const oldId = String(item.id || '');
+        let newId = uid();
+        while (usedIds.has(newId)) newId = uid();
+        usedIds.add(newId);
+        if (oldId && !idMap.has(oldId)) idMap.set(oldId, newId);
+        item.id = newId;
+      });
     });
 
+    const achievementIds = new Set(workspace.achievements.map((item) => item.id));
+    workspace.evidence.forEach((item) => {
+      const mapped = item.linkedAchievementId ? (idMap.get(item.linkedAchievementId) || item.linkedAchievementId) : '';
+      item.linkedAchievementId = achievementIds.has(mapped) ? mapped : '';
+    });
+
+    const usedActivityIds = new Set();
     workspace.activity = (Array.isArray(source.activity) ? source.activity : [])
       .slice(0, 60)
       .map((entry) => {
         if (!entry || typeof entry !== 'object') return null;
+        let id = uid();
+        while (usedActivityIds.has(id)) id = uid();
+        usedActivityIds.add(id);
         return {
-          id: text(entry.id, 64) || uid(),
+          id,
           kind: text(entry.kind, 24) || 'created',
           section: SECTIONS[entry.section] ? String(entry.section) : '',
           title: text(entry.title, 140),
@@ -3418,11 +3547,20 @@
 
     try {
       const imported = normalizeImportedWorkspace(source);
-      Store.saveWorkspace(state.user.id, imported);
+      const importedBytes = Store.workspaceBytes(imported);
+      if (importedBytes > Store.MAX_WORKSPACE_BYTES) {
+        toast('حجم النسخة بعد المعالجة أكبر من الحد المسموح (4.5 م.ب). احذف بعض المرفقات ثم أعد المحاولة.', 'error');
+        return;
+      }
+      await Store.replaceWorkspace(imported);
       state.workspace = imported;
       state.profile = imported.profile;
       state.user.name = imported.profile.fullName || state.user.name;
-      Store.updateAccountName(state.user.id, state.user.name);
+      try {
+        await Store.updateAccountName(state.user.name);
+      } catch (error) {
+        console.warn('[Athari] تعذّر تحديث اسم الحساب بعد الاستيراد.', error);
+      }
       renderShell();
       renderRoute();
       toast('تم استيراد النسخة الاحتياطية واستعادة ملفك بنجاح.', 'success');
@@ -3597,41 +3735,71 @@
     renderRoute();
   });
 
-  window.addEventListener('storage', (event) => {
-    if (!state.user) return;
-    if (!event.key || event.key === 'athari.v1.session') {
-      const session = Store.getSession();
-      if (!session) {
-        state.user = null;
-        state.workspace = null;
-        state.profile = null;
-        state.currentRoute = 'dashboard';
-        state.filters = {};
-        document.getElementById('app-view').hidden = true;
-        history.replaceState(null, '', window.location.pathname + window.location.search);
-        renderAuth('login');
-        document.title = 'أثري | ملف إنجازي الرقمي';
-        toast('تم تسجيل الخروج من هذا الحساب في نافذة أخرى.', 'info');
-        return;
-      }
-      if (session.id !== state.user.id) {
-        enterApp(session);
-        return;
-      }
-    }
-    if (!event.key || event.key === `athari.v1.workspace.${state.user.id}`) {
-      try {
-        state.workspace = Store.getWorkspace(state.user.id);
-        state.profile = state.workspace.profile;
-        renderShell();
-        renderRoute();
-      } catch {
-        // تجاهل تحديثًا غير صالح من نافذة أخرى.
-      }
-    }
-  });
+  function resetToLogin(message) {
+    closeAllModals();
+    state.user = null;
+    state.workspace = null;
+    state.profile = null;
+    state.currentRoute = 'dashboard';
+    state.filters = {};
+    const appView = document.getElementById('app-view');
+    if (appView) appView.hidden = true;
+    history.replaceState(null, '', window.location.pathname + window.location.search);
+    renderAuth('login');
+    document.title = 'أثري | ملف إنجازي الرقمي';
+    if (message) toast(message, 'info');
+  }
 
-  function init() {
+  function showConfigScreen(message) {
+    const authView = document.getElementById('auth-view');
+    if (!authView) return;
+    authView.hidden = false;
+    authView.innerHTML = `
+      <div class="auth-shell">
+        <section class="auth-panel" style="grid-column:1/-1">
+          <div class="auth-card">
+            <span class="auth-eyebrow"><span class="dot"></span>إعداد مطلوب</span>
+            <h1 class="auth-title">اربط أثري بـ Supabase</h1>
+            <p class="auth-subtitle">${escapeHtml(message || Store.configError || 'لم تُضبط إعدادات Supabase بعد.')}</p>
+            <div class="auth-local-note">
+              ${icon('shield')}
+              <span>لا تضع مفتاح service_role في الواجهة أبدًا. استخدم anon public key فقط.</span>
+            </div>
+            <ol style="line-height:2;padding-inline-start:22px;margin:18px 0;color:var(--text-2)">
+              <li>أنشئ مشروعًا على supabase.com.</li>
+              <li>افتح Project Settings ← API.</li>
+              <li>انسخ Project URL و anon public key.</li>
+              <li>ضعهما في ملف public/supabase-config.js.</li>
+              <li>نفّذ ملف supabase/schema.sql من SQL Editor.</li>
+              <li>أعد نشر الموقع ثم أعد تحميل الصفحة.</li>
+            </ol>
+            <p class="auth-panel-foot">التفاصيل الكاملة موجودة في README.md</p>
+          </div>
+        </section>
+      </div>
+    `;
+  }
+
+  if (Store && typeof Store.onAuthStateChange === 'function') {
+    Store.onAuthStateChange(async (event, session) => {
+      if (event === 'SIGNED_OUT') {
+        if (isLoggingOut || !state.user) return;
+        resetToLogin('تم تسجيل الخروج من هذا الحساب.');
+        return;
+      }
+      if (event === 'TOKEN_REFRESHED' || event === 'USER_UPDATED') {
+        if (session && state.user && session.id === state.user.id) state.user = session;
+        return;
+      }
+      if (event === 'SIGNED_IN' && session) {
+        if (!state.user || state.user.id !== session.id) {
+          await enterApp(session);
+        }
+      }
+    });
+  }
+
+  async function init() {
     const scrim = document.getElementById('sidebar-scrim');
     if (scrim) scrim.addEventListener('click', closeSidebar);
 
@@ -3640,16 +3808,26 @@
       const authView = document.getElementById('auth-view');
       if (authView) {
         authView.hidden = false;
-        authView.innerHTML = `<div class="auth-shell"><section class="auth-panel" style="grid-column:1/-1"><div class="auth-card"><h1 class="auth-title">تعذّر تحميل التطبيق</h1><p class="auth-subtitle">لم تتحمّل طبقة البيانات المحلية. أعد تحميل الصفحة أو استخدم متصفحًا حديثًا.</p></div></section></div>`;
+        authView.innerHTML = `<div class="auth-shell"><section class="auth-panel" style="grid-column:1/-1"><div class="auth-card"><h1 class="auth-title">تعذّر تحميل التطبيق</h1><p class="auth-subtitle">لم تتحمّل طبقة البيانات. أعد تحميل الصفحة أو استخدم متصفحًا حديثًا.</p></div></section></div>`;
       }
       return;
     }
 
+    if (!Store.isConfigured) {
+      hideBoot();
+      showConfigScreen(Store.configError);
+      return;
+    }
+
     try {
-      const session = Store.getSession();
-      if (session) {
-        enterApp(session);
-      } else {
+      const session = await Store.getSession();
+      if (!session) {
+        renderAuth('login');
+        hideBoot();
+        return;
+      }
+      const entered = await enterApp(session);
+      if (!entered) {
         renderAuth('login');
         hideBoot();
       }
