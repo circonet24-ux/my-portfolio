@@ -1,91 +1,23 @@
 /*
- * أثري — طبقة البيانات المحلية
- * كل الحسابات والمساحات تُحفظ في localStorage / sessionStorage.
+ * أثري — طبقة البيانات السحابية
+ * Supabase Auth + Postgres مع Row Level Security
+ *
+ * ملاحظة أمنية:
+ * - هذا الملف يستخدم anon public key فقط.
+ * - لا تضع service_role key هنا أو في أي ملف داخل public.
  */
 (function () {
   'use strict';
 
-  const NS = 'athari.v1';
-  const USERS_KEY = `${NS}.users`;
-  const SESSION_KEY = `${NS}.session`;
-  const WORKSPACE_PREFIX = `${NS}.workspace.`;
-  const DEFAULT_PBKDF2_ITERATIONS = 210000;
-  const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
-  const MAX_WORKSPACE_BYTES = 4.5 * 1024 * 1024;
-
   const SECTION_KEYS = ['achievements', 'evidence', 'reports'];
+  const MAX_WORKSPACE_BYTES = 4.5 * 1024 * 1024;
+  const AUTH_STORAGE_KEY = 'athari.supabase.auth';
 
   class StoreError extends Error {
     constructor(message, code = 'STORE_ERROR') {
       super(message);
       this.name = 'StoreError';
       this.code = code;
-    }
-  }
-
-  function safeStorage(kind) {
-    try {
-      const storage = kind === 'session' ? window.sessionStorage : window.localStorage;
-      const probe = `${NS}.probe`;
-      storage.setItem(probe, '1');
-      storage.removeItem(probe);
-      return storage;
-    } catch {
-      return null;
-    }
-  }
-
-  const local = safeStorage('local');
-  const session = safeStorage('session');
-
-  function requireLocal() {
-    if (!local) {
-      throw new StoreError(
-        'تعذّر الوصول إلى التخزين المحلي. تأكد من السماح للمتصفح بحفظ بيانات الموقع.',
-        'STORAGE_UNAVAILABLE',
-      );
-    }
-    return local;
-  }
-
-  function readJSON(storage, key, fallback) {
-    if (!storage) return fallback;
-    try {
-      const raw = storage.getItem(key);
-      if (!raw) return fallback;
-      return JSON.parse(raw);
-    } catch {
-      return fallback;
-    }
-  }
-
-  function writeJSON(storage, key, value) {
-    if (!storage) throw new StoreError('التخزين المحلي غير متاح.', 'STORAGE_UNAVAILABLE');
-    try {
-      storage.setItem(key, JSON.stringify(value));
-    } catch (error) {
-      if (
-        error &&
-        (error.name === 'QuotaExceededError' ||
-          error.name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
-          error.code === 22 ||
-          error.code === 1014)
-      ) {
-        throw new StoreError(
-          'امتلأت مساحة التخزين المحلية. احذف بعض المرفقات أو صدّر نسخة احتياطية ثم أفرغ مساحة.',
-          'QUOTA_EXCEEDED',
-        );
-      }
-      throw new StoreError('تعذّر حفظ البيانات في المتصفح.', 'STORAGE_WRITE_FAILED');
-    }
-  }
-
-  function jsonBytes(value) {
-    const raw = JSON.stringify(value);
-    try {
-      return new Blob([raw]).size;
-    } catch {
-      return raw.length * 2;
     }
   }
 
@@ -107,148 +39,170 @@
     return '';
   }
 
-  function getUsers() {
-    const users = readJSON(requireLocal(), USERS_KEY, []);
-    return Array.isArray(users) ? users : [];
+  function cleanText(value, maxLength = 1000) {
+    return String(value ?? '').trim().slice(0, maxLength);
   }
 
-  function saveUsers(users) {
-    writeJSON(requireLocal(), USERS_KEY, users);
+  function normalizeTimestamp(value) {
+    const date = new Date(value || Date.now());
+    return Number.isNaN(date.getTime()) ? new Date().toISOString() : date.toISOString();
   }
 
-  function publicUser(user) {
-    if (!user) return null;
-    return {
-      id: user.id,
-      name: user.name,
-      email: user.email,
-      createdAt: user.createdAt,
-      lastLoginAt: user.lastLoginAt || null,
-    };
+  function isUuid(value) {
+    return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(value || ''));
   }
 
-  function findUserByEmail(email) {
-    const key = normalizeEmail(email);
-    return getUsers().find((user) => user.emailKey === key) || null;
-  }
-
-  function findUserById(userId) {
-    return getUsers().find((user) => user.id === userId) || null;
-  }
-
-  function bytesToBase64(bytes) {
-    let binary = '';
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-      binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary);
-  }
-
-  function base64ToBytes(base64) {
-    const binary = atob(base64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  }
-
-  function randomBase64(byteCount = 16) {
-    const bytes = new Uint8Array(byteCount);
-    crypto.getRandomValues(bytes);
-    return bytesToBase64(bytes);
-  }
-
-  function makeId() {
+  function makeUuid() {
     if (window.crypto && typeof window.crypto.randomUUID === 'function') {
       return window.crypto.randomUUID();
     }
     const bytes = new Uint8Array(16);
     crypto.getRandomValues(bytes);
-    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
   }
 
-  function constantTimeEqual(left, right) {
-    const a = String(left || '');
-    const b = String(right || '');
-    if (a.length !== b.length) return false;
-    let diff = 0;
-    for (let i = 0; i < a.length; i += 1) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-    return diff === 0;
+  function jsonBytes(value) {
+    const raw = JSON.stringify(value);
+    try {
+      return new Blob([raw]).size;
+    } catch {
+      return raw.length * 2;
+    }
   }
 
-  async function derivePasswordHash(password, saltBase64, iterations) {
-    if (!window.crypto || !window.crypto.subtle) {
+  function publicUser(user) {
+    if (!user) return null;
+    const metadata = user.user_metadata || {};
+    const email = user.email || '';
+    return {
+      id: user.id,
+      name: metadata.full_name || metadata.name || email.split('@')[0] || 'مستخدم',
+      email,
+      createdAt: user.created_at || null,
+      lastLoginAt: user.last_sign_in_at || null,
+    };
+  }
+
+  function authErrorMessage(error) {
+    const message = String(error && error.message ? error.message : error || '');
+    if (/Invalid login credentials/i.test(message)) return 'البريد الإلكتروني أو كلمة المرور غير صحيحة.';
+    if (/Email not confirmed/i.test(message)) return 'يرجى تأكيد بريدك الإلكتروني من الرسالة التي وصلتك قبل تسجيل الدخول.';
+    if (/User already registered|already been registered/i.test(message)) return 'يوجد حساب مسجّل بهذا البريد الإلكتروني.';
+    if (/Password should be at least|Password is too short/i.test(message)) return 'كلمة المرور قصيرة جدًا. استخدم 8 أحرف على الأقل.';
+    if (/For security purposes|rate limit|too many requests/i.test(message)) return 'محاولات كثيرة. انتظر قليلًا ثم حاول مرة أخرى.';
+    if (/Failed to fetch|NetworkError|fetch failed/i.test(message)) return 'تعذّر الاتصال بخادم Supabase. تحقق من اتصال الإنترنت ومن إعدادات المشروع.';
+    if (/JWT|not authenticated|Auth session missing|session.*missing/i.test(message)) return 'انتهت جلسة الدخول. سجّل الدخول مرة أخرى.';
+    return message || 'تعذّر إتمام العملية.';
+  }
+
+  function databaseErrorMessage(error) {
+    const message = String(error && error.message ? error.message : error || '');
+    if (/relation .* does not exist|Could not find the table|schema cache/i.test(message)) {
+      return 'جداول Supabase غير موجودة. نفّذ ملف supabase/schema.sql أولًا من SQL Editor.';
+    }
+    if (/Could not find the function|function .* does not exist/i.test(message)) {
+      return 'دالة replace_workspace غير موجودة. نفّذ ملف supabase/schema.sql كاملًا.';
+    }
+    if (/row-level security|permission denied/i.test(message)) {
+      return 'لا تملك صلاحية الوصول إلى هذه البيانات. تأكد من تسجيل الدخول ومن سياسات RLS.';
+    }
+    return message || 'تعذّر إتمام العملية في قاعدة البيانات.';
+  }
+
+  function throwAuth(error) {
+    throw new StoreError(authErrorMessage(error), 'AUTH_ERROR');
+  }
+
+  function throwDb(error, fallback) {
+    if (error) console.error('[Supabase]', error.message || error);
+    throw new StoreError(databaseErrorMessage(error) || fallback || 'تعذّر إتمام العملية.', 'DB_ERROR');
+  }
+
+  function assertPublicKey(key) {
+    const value = String(key || '');
+    if (value.startsWith('sb_secret_') || value.includes('service_role')) {
       throw new StoreError(
-        'متصفحك لا يدعم حماية كلمة المرور المطلوبة. افتح التطبيق عبر HTTPS أو استخدم متصفحًا حديثًا.',
-        'CRYPTO_UNAVAILABLE',
+        'هذا المفتاح سري (service_role). استخدم anon public key فقط، ولا تضعه في الواجهة.',
+        'SERVICE_ROLE_FORBIDDEN',
       );
     }
-    const passwordBytes = new TextEncoder().encode(String(password));
-    const salt = base64ToBytes(saltBase64);
-    const material = await crypto.subtle.importKey(
-      'raw',
-      passwordBytes,
-      { name: 'PBKDF2' },
-      false,
-      ['deriveBits'],
-    );
-    const bits = await crypto.subtle.deriveBits(
-      {
-        name: 'PBKDF2',
-        salt,
-        iterations,
-        hash: 'SHA-256',
-      },
-      material,
-      256,
-    );
-    return bytesToBase64(new Uint8Array(bits));
+    if (!value.startsWith('eyJ')) return;
+    const parts = value.split('.');
+    if (parts.length < 2) return;
+    try {
+      let payload = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+      while (payload.length % 4) payload += '=';
+      const parsed = JSON.parse(atob(payload));
+      if (parsed.role === 'service_role') {
+        throw new StoreError(
+          'هذا المفتاح سري (service_role). استخدم anon public key فقط، ولا تضعه في الواجهة.',
+          'SERVICE_ROLE_FORBIDDEN',
+        );
+      }
+    } catch (error) {
+      if (error instanceof StoreError) throw error;
+    }
   }
 
-  function saveSession(userId, remember) {
-    const now = Date.now();
+  const config = window.ATHARI_SUPABASE || {};
+  let client = null;
+  let configError = '';
+
+  if (!window.supabase || typeof window.supabase.createClient !== 'function') {
+    configError = 'تعذّر تحميل مكتبة Supabase. تحقق من اتصال الإنترنت ثم أعد تحميل الصفحة.';
+  } else if (!config.url || !config.anonKey) {
+    configError = 'لم تُضبط إعدادات Supabase بعد. أضف Project URL و anon public key في ملف supabase-config.js.';
+  } else {
+    try {
+      assertPublicKey(config.anonKey);
+      client = window.supabase.createClient(String(config.url).replace(/\/$/, ''), config.anonKey, {
+        auth: {
+          storageKey: AUTH_STORAGE_KEY,
+          persistSession: true,
+          autoRefreshToken: true,
+          detectSessionInUrl: true,
+        },
+      });
+    } catch (error) {
+      configError = error.message || 'تعذّر تهيئة اتصال Supabase.';
+      console.error('[Supabase]', configError);
+    }
+  }
+
+  const isConfigured = Boolean(client);
+
+  function requireClient() {
+    if (!client) {
+      throw new StoreError(
+        configError || 'لم يتم إعداد اتصال Supabase.',
+        'SUPABASE_NOT_CONFIGURED',
+      );
+    }
+    return client;
+  }
+
+  async function requireSession() {
+    const supabase = requireClient();
+    const { data, error } = await supabase.auth.getSession();
+    if (error || !data || !data.session) {
+      throw new StoreError('انتهت جلسة الدخول. سجّل الدخول مرة أخرى.', 'AUTH_REQUIRED');
+    }
+    return data.session;
+  }
+
+  async function ensureProfile(user, name) {
+    const supabase = requireClient();
     const payload = {
-      userId,
-      createdAt: new Date(now).toISOString(),
-      expiresAt: now + SESSION_TTL_MS,
+      id: user.id,
+      full_name: cleanText(name || (user.user_metadata && user.user_metadata.full_name) || '', 80),
     };
-    try {
-      if (local) local.removeItem(SESSION_KEY);
-      if (session) session.removeItem(SESSION_KEY);
-      const target = remember ? requireLocal() : (session || requireLocal());
-      target.setItem(SESSION_KEY, JSON.stringify(payload));
-    } catch {
-      throw new StoreError('تعذّر بدء جلسة الدخول في هذا المتصفح.', 'SESSION_FAILED');
-    }
-  }
-
-  function clearSession() {
-    try {
-      if (local) local.removeItem(SESSION_KEY);
-      if (session) session.removeItem(SESSION_KEY);
-    } catch {
-      // لا شيء يمكن فعله إن كان التخزين مقفلًا.
-    }
-  }
-
-  function getSession() {
-    const sources = [local, session];
-    for (const storage of sources) {
-      if (!storage) continue;
-      const raw = readJSON(storage, SESSION_KEY, null);
-      if (!raw || !raw.userId) continue;
-      if (!raw.expiresAt || Number(raw.expiresAt) <= Date.now()) {
-        try { storage.removeItem(SESSION_KEY); } catch { /* تجاهل */ }
-        continue;
-      }
-      const user = findUserById(raw.userId);
-      if (!user) {
-        try { storage.removeItem(SESSION_KEY); } catch { /* تجاهل */ }
-        continue;
-      }
-      return publicUser(user);
-    }
-    return null;
+    const { error } = await supabase
+      .from('profiles')
+      .upsert(payload, { onConflict: 'id', ignoreDuplicates: true });
+    if (error) throwDb(error, 'تعذّر تهيئة الملف المهني.');
   }
 
   function emptyWorkspace(account) {
@@ -279,51 +233,125 @@
     };
   }
 
-  function normalizeWorkspace(data, account) {
-    const fallback = emptyWorkspace(account);
-    if (!data || typeof data !== 'object' || Array.isArray(data)) return fallback;
-    const workspace = { ...fallback, ...data };
-    workspace.version = 1;
-    workspace.profile = {
-      ...fallback.profile,
-      ...(data.profile && typeof data.profile === 'object' && !Array.isArray(data.profile) ? data.profile : {}),
+  function profileToRow(profile) {
+    const source = profile && typeof profile === 'object' ? profile : {};
+    return {
+      full_name: cleanText(source.fullName, 80),
+      job_title: cleanText(source.jobTitle, 100),
+      organization: cleanText(source.organization, 120),
+      specialization: cleanText(source.specialization, 100),
+      location: cleanText(source.location, 80),
+      contact_email: cleanText(source.email, 160),
+      phone: cleanText(source.phone, 30),
+      website: cleanText(source.website, 300),
+      years_experience: cleanText(source.yearsExperience, 20),
+      bio: cleanText(source.bio, 3000),
+      skills: Array.isArray(source.skills)
+        ? source.skills.map((skill) => cleanText(skill, 40)).filter(Boolean).slice(0, 20)
+        : [],
+      photo: source.photo && typeof source.photo === 'object' && source.photo.dataUrl
+        ? source.photo
+        : null,
+      updated_at: new Date().toISOString(),
     };
-    for (const key of SECTION_KEYS) {
-      workspace[key] = Array.isArray(data[key]) ? data[key] : [];
+  }
+
+  function rowToProfile(row, user) {
+    const source = row && typeof row === 'object' ? row : {};
+    return {
+      fullName: source.full_name || user?.name || '',
+      jobTitle: source.job_title || '',
+      organization: source.organization || '',
+      specialization: source.specialization || '',
+      location: source.location || '',
+      email: source.contact_email || '',
+      phone: source.phone || '',
+      website: source.website || '',
+      yearsExperience: source.years_experience || '',
+      bio: source.bio || '',
+      skills: Array.isArray(source.skills) ? source.skills : [],
+      photo: source.photo && typeof source.photo === 'object' ? source.photo : null,
+      updatedAt: source.updated_at || new Date().toISOString(),
+    };
+  }
+
+  function itemToRow(section, item, userId, options = {}) {
+    const source = item && typeof item === 'object' ? item : {};
+    const status = section === 'reports' && ['draft', 'final', 'approved'].includes(source.status)
+      ? source.status
+      : '';
+    const evidenceType = section === 'evidence' && ['document', 'image', 'link', 'note'].includes(source.evidenceType)
+      ? source.evidenceType
+      : '';
+    const row = {
+      user_id: userId,
+      section,
+      title: cleanText(source.title || 'بدون عنوان', 160) || 'بدون عنوان',
+      category: cleanText(source.category, 60),
+      item_date: /^\d{4}-\d{2}-\d{2}$/.test(String(source.date || '')) ? String(source.date) : null,
+      description: cleanText(source.description, 2000),
+      tags: Array.isArray(source.tags)
+        ? source.tags.map((tag) => cleanText(tag, 28)).filter(Boolean).slice(0, 10)
+        : [],
+      link: cleanText(source.link, 1000),
+      attachments: Array.isArray(source.attachments) ? source.attachments.slice(0, 8) : [],
+      content: section === 'reports' ? cleanText(source.content, 12000) : '',
+      impact: cleanText(source.impact, 3000),
+      status,
+      evidence_type: evidenceType,
+      linked_achievement_id: section === 'evidence' && isUuid(source.linkedAchievementId)
+        ? source.linkedAchievementId
+        : null,
+      updated_at: normalizeTimestamp(source.updatedAt),
+    };
+    if (options.includeCreatedAt) {
+      row.id = isUuid(source.id) ? source.id : makeUuid();
+      row.created_at = normalizeTimestamp(source.createdAt);
     }
-    workspace.activity = Array.isArray(data.activity) ? data.activity.slice(0, 60) : [];
-    if (!Array.isArray(workspace.profile.skills)) workspace.profile.skills = [];
-    return workspace;
+    return row;
   }
 
-  function getWorkspace(userId) {
-    const account = findUserById(userId);
-    if (!account) throw new StoreError('الحساب غير موجود.', 'USER_NOT_FOUND');
-    const key = `${WORKSPACE_PREFIX}${userId}`;
-    const raw = readJSON(requireLocal(), key, null);
-    if (raw) return normalizeWorkspace(raw, account);
-    const workspace = emptyWorkspace(account);
-    writeJSON(requireLocal(), key, workspace);
-    return workspace;
+  function rowToItem(row) {
+    return {
+      id: row.id,
+      section: row.section,
+      title: row.title || '',
+      category: row.category || '',
+      date: row.item_date || '',
+      description: row.description || '',
+      tags: Array.isArray(row.tags) ? row.tags : [],
+      link: row.link || '',
+      attachments: Array.isArray(row.attachments) ? row.attachments : [],
+      content: row.content || '',
+      impact: row.impact || '',
+      status: row.status || '',
+      evidenceType: row.evidence_type || '',
+      linkedAchievementId: row.linked_achievement_id || '',
+      createdAt: row.created_at || null,
+      updatedAt: row.updated_at || null,
+    };
   }
 
-  function saveWorkspace(userId, workspace) {
-    if (!findUserById(userId)) throw new StoreError('الحساب غير موجود.', 'USER_NOT_FOUND');
-    const bytes = jsonBytes(workspace);
-    if (bytes > MAX_WORKSPACE_BYTES) {
-      throw new StoreError(
-        'المساحة المخصصة للملف ممتلئة تقريبًا. احذف بعض المرفقات أو صدّر نسخة احتياطية.',
-        'WORKSPACE_LIMIT',
-      );
-    }
-    writeJSON(requireLocal(), `${WORKSPACE_PREFIX}${userId}`, workspace);
+  function rowToActivity(row) {
+    return {
+      id: row.id,
+      kind: row.kind || 'created',
+      section: row.section || '',
+      title: row.title || '',
+      at: row.created_at || null,
+    };
   }
 
-  function workspaceBytes(workspace) {
-    return jsonBytes(workspace);
+  function latestTimestamp(values) {
+    return values
+      .filter(Boolean)
+      .map((value) => ({ value, time: new Date(value).getTime() }))
+      .filter((entry) => Number.isFinite(entry.time))
+      .sort((a, b) => b.time - a.time)[0]?.value || new Date().toISOString();
   }
 
   async function register({ name, email, password }) {
+    const supabase = requireClient();
     const cleanName = String(name || '').trim().replace(/\s+/g, ' ');
     const cleanEmail = normalizeEmail(email);
     if (cleanName.length < 2) throw new StoreError('أدخل الاسم الكامل (حرفان على الأقل).', 'INVALID_NAME');
@@ -332,129 +360,284 @@
     const passwordError = passwordProblem(password);
     if (passwordError) throw new StoreError(passwordError, 'INVALID_PASSWORD');
 
-    const users = getUsers();
-    if (users.some((user) => user.emailKey === cleanEmail)) {
+    const { data, error } = await supabase.auth.signUp({
+      email: cleanEmail,
+      password,
+      options: { data: { full_name: cleanName } },
+    });
+    if (error) throwAuth(error);
+    if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
       throw new StoreError('يوجد حساب مسجّل بهذا البريد الإلكتروني.', 'EMAIL_EXISTS');
     }
-
-    const salt = randomBase64(16);
-    const iterations = DEFAULT_PBKDF2_ITERATIONS;
-    const passwordHash = await derivePasswordHash(password, salt, iterations);
-    const now = new Date().toISOString();
-    const user = {
-      id: makeId(),
-      name: cleanName,
-      email: cleanEmail,
-      emailKey: cleanEmail,
-      salt,
-      passwordHash,
-      iterations,
-      createdAt: now,
-      lastLoginAt: now,
-    };
-    users.push(user);
-    saveUsers(users);
-    const workspace = emptyWorkspace(user);
-    writeJSON(requireLocal(), `${WORKSPACE_PREFIX}${user.id}`, workspace);
-    saveSession(user.id, true);
-    return publicUser(user);
+    if (!data.session) {
+      return {
+        user: data.user ? publicUser(data.user) : null,
+        needsConfirmation: true,
+      };
+    }
+    await ensureProfile(data.user, cleanName);
+    return { user: publicUser(data.user), needsConfirmation: false };
   }
 
-  async function login({ email, password, remember = true }) {
-    const user = findUserByEmail(email);
-    if (!user) {
-      // اشتقاق وهمي للحفاظ على زمن استجابة متقارب.
-      await derivePasswordHash(password || '', randomBase64(16), DEFAULT_PBKDF2_ITERATIONS).catch(() => {});
-      throw new StoreError('البريد الإلكتروني أو كلمة المرور غير صحيحة.', 'INVALID_CREDENTIALS');
-    }
-    const passwordHash = await derivePasswordHash(
-      password || '',
-      user.salt,
-      Number(user.iterations) || DEFAULT_PBKDF2_ITERATIONS,
-    );
-    if (!constantTimeEqual(passwordHash, user.passwordHash)) {
-      throw new StoreError('البريد الإلكتروني أو كلمة المرور غير صحيحة.', 'INVALID_CREDENTIALS');
-    }
-    const users = getUsers();
-    const index = users.findIndex((entry) => entry.id === user.id);
-    if (index !== -1) {
-      users[index].lastLoginAt = new Date().toISOString();
-      saveUsers(users);
-    }
-    saveSession(user.id, remember);
-    return publicUser(users[index] || user);
+  async function login({ email, password }) {
+    const supabase = requireClient();
+    if (!isValidEmail(email)) throw new StoreError('أدخل بريدًا إلكترونيًا صالحًا.', 'INVALID_EMAIL');
+    if (!password) throw new StoreError('أدخل كلمة المرور.', 'INVALID_PASSWORD');
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email: normalizeEmail(email),
+      password,
+    });
+    if (error) throwAuth(error);
+    await ensureProfile(data.user, data.user.user_metadata?.full_name || '');
+    return publicUser(data.user);
   }
 
-  async function changePassword(userId, currentPassword, newPassword) {
-    const users = getUsers();
-    const index = users.findIndex((user) => user.id === userId);
-    if (index === -1) throw new StoreError('الحساب غير موجود.', 'USER_NOT_FOUND');
-    const user = users[index];
-    const currentHash = await derivePasswordHash(
-      currentPassword || '',
-      user.salt,
-      Number(user.iterations) || DEFAULT_PBKDF2_ITERATIONS,
-    );
-    if (!constantTimeEqual(currentHash, user.passwordHash)) {
-      throw new StoreError('كلمة المرور الحالية غير صحيحة.', 'INVALID_PASSWORD');
+  async function getSession() {
+    if (!client) return null;
+    const { data, error } = await client.auth.getSession();
+    if (error) {
+      console.error('[Supabase]', error.message || error);
+      return null;
     }
-    const nextProblem = passwordProblem(newPassword);
-    if (nextProblem) throw new StoreError(nextProblem, 'INVALID_PASSWORD');
-    const salt = randomBase64(16);
-    const iterations = DEFAULT_PBKDF2_ITERATIONS;
-    users[index] = {
-      ...user,
-      salt,
-      iterations,
-      passwordHash: await derivePasswordHash(newPassword, salt, iterations),
-      updatedAt: new Date().toISOString(),
-    };
-    saveUsers(users);
+    return data.session ? publicUser(data.session.user) : null;
+  }
+
+  function onAuthStateChange(callback) {
+    if (!client) {
+      return { data: { subscription: { unsubscribe() {} } } };
+    }
+    return client.auth.onAuthStateChange((event, session) => {
+      const user = session ? publicUser(session.user) : null;
+      // تأجيل المعالجة خارج قفل Supabase Auth لتجنب التعارض مع استعلامات قاعدة البيانات.
+      setTimeout(() => {
+        try {
+          const result = callback(event, user);
+          if (result && typeof result.catch === 'function') {
+            result.catch((error) => console.error('[Supabase auth listener]', error));
+          }
+        } catch (error) {
+          console.error('[Supabase auth listener]', error);
+        }
+      }, 0);
+    });
+  }
+
+  async function logout() {
+    if (!client) return true;
+    const { error } = await client.auth.signOut();
+    if (error) throwAuth(error);
     return true;
   }
 
-  function updateAccountName(userId, name) {
+  async function changePassword(currentPassword, newPassword) {
+    const supabase = requireClient();
+    const session = await requireSession();
+    const email = session.user.email;
+    if (!email) throw new StoreError('تعذّر تحديد بريد الحساب.', 'EMAIL_MISSING');
+    if (!currentPassword) throw new StoreError('أدخل كلمة المرور الحالية.', 'INVALID_PASSWORD');
+    const problem = passwordProblem(newPassword);
+    if (problem) throw new StoreError(problem, 'INVALID_PASSWORD');
+    const { error: verifyError } = await supabase.auth.signInWithPassword({
+      email,
+      password: currentPassword,
+    });
+    if (verifyError) throw new StoreError('كلمة المرور الحالية غير صحيحة.', 'INVALID_PASSWORD');
+    const { error } = await supabase.auth.updateUser({ password: newPassword });
+    if (error) throwAuth(error);
+    return true;
+  }
+
+  async function updateAccountName(name) {
+    const supabase = requireClient();
+    const session = await requireSession();
     const cleanName = String(name || '').trim().replace(/\s+/g, ' ');
-    if (cleanName.length < 2) return;
-    const users = getUsers();
-    const index = users.findIndex((user) => user.id === userId);
-    if (index === -1) return;
-    users[index].name = cleanName;
-    users[index].updatedAt = new Date().toISOString();
-    saveUsers(users);
+    if (cleanName.length < 2) return false;
+    const { error: authError } = await supabase.auth.updateUser({
+      data: { ...(session.user.user_metadata || {}), full_name: cleanName },
+    });
+    if (authError) throwAuth(authError);
+    const { error } = await supabase.from('profiles').upsert({
+      id: session.user.id,
+      full_name: cleanName.slice(0, 80),
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'id' });
+    if (error) throwDb(error, 'تعذّر تحديث اسم الحساب.');
+    return true;
   }
 
-  function accountExists(email) {
-    return Boolean(findUserByEmail(email));
-  }
-
-  function hasUsers() {
-    try {
-      return getUsers().length > 0;
-    } catch {
-      return false;
+  async function getWorkspace(userId) {
+    const supabase = requireClient();
+    const session = await requireSession();
+    if (userId && session.user.id !== userId) {
+      throw new StoreError('الحساب غير مطابق للجلسة الحالية.', 'USER_MISMATCH');
     }
+    const user = publicUser(session.user);
+    const [profileResult, itemsResult, activityResult] = await Promise.all([
+      supabase.from('profiles').select('*').eq('id', session.user.id).maybeSingle(),
+      supabase.from('items').select('*').eq('user_id', session.user.id).order('updated_at', { ascending: false }).range(0, 1999),
+      supabase.from('activity').select('*').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit(60),
+    ]);
+    if (profileResult.error) throwDb(profileResult.error, 'تعذّر تحميل الملف المهني.');
+    if (itemsResult.error) throwDb(itemsResult.error, 'تعذّر تحميل عناصر الملف.');
+    if (activityResult.error) throwDb(activityResult.error, 'تعذّر تحميل النشاط.');
+
+    let profileRow = profileResult.data;
+    if (!profileRow) {
+      await ensureProfile(session.user, user.name);
+      const retry = await supabase.from('profiles').select('*').eq('id', session.user.id).maybeSingle();
+      if (retry.error) throwDb(retry.error, 'تعذّر تهيئة الملف المهني.');
+      profileRow = retry.data;
+    }
+
+    const workspace = emptyWorkspace(user);
+    workspace.createdAt = profileRow?.created_at || user.createdAt || workspace.createdAt;
+    workspace.profile = rowToProfile(profileRow, user);
+    workspace.activity = (activityResult.data || []).map(rowToActivity);
+    const itemTimestamps = [];
+    (itemsResult.data || []).forEach((row) => {
+      if (!SECTION_KEYS.includes(row.section)) return;
+      workspace[row.section].push(rowToItem(row));
+      if (row.updated_at) itemTimestamps.push(row.updated_at);
+    });
+    workspace.updatedAt = latestTimestamp([
+      profileRow?.updated_at,
+      ...itemTimestamps,
+      workspace.activity[0]?.at,
+    ]);
+    return workspace;
+  }
+
+  async function saveProfile(profile) {
+    const supabase = requireClient();
+    const session = await requireSession();
+    const { error } = await supabase.from('profiles').upsert({
+      id: session.user.id,
+      ...profileToRow(profile),
+    }, { onConflict: 'id' });
+    if (error) throwDb(error, 'تعذّر حفظ الملف المهني.');
+    return true;
+  }
+
+  async function createItem(section, item) {
+    const supabase = requireClient();
+    if (!SECTION_KEYS.includes(section)) throw new StoreError('نوع المحتوى غير صالح.', 'INVALID_SECTION');
+    const session = await requireSession();
+    const row = itemToRow(section, item, session.user.id, { includeCreatedAt: true });
+    const { data, error } = await supabase.from('items').insert(row).select('*').single();
+    if (error) throwDb(error, 'تعذّر إضافة العنصر.');
+    return rowToItem(data);
+  }
+
+  async function updateItem(section, item) {
+    const supabase = requireClient();
+    if (!SECTION_KEYS.includes(section)) throw new StoreError('نوع المحتوى غير صالح.', 'INVALID_SECTION');
+    if (!item || !isUuid(item.id)) throw new StoreError('معرّف العنصر غير صالح.', 'INVALID_ITEM');
+    const session = await requireSession();
+    const row = itemToRow(section, item, session.user.id, { includeCreatedAt: false });
+    delete row.id;
+    const { data, error } = await supabase
+      .from('items')
+      .update(row)
+      .eq('id', item.id)
+      .eq('user_id', session.user.id)
+      .select('*')
+      .maybeSingle();
+    if (error) throwDb(error, 'تعذّر تحديث العنصر.');
+    if (!data) throw new StoreError('لم يعد هذا العنصر موجودًا.', 'ITEM_NOT_FOUND');
+    return rowToItem(data);
+  }
+
+  async function deleteItem(section, id) {
+    const supabase = requireClient();
+    if (!SECTION_KEYS.includes(section)) throw new StoreError('نوع المحتوى غير صالح.', 'INVALID_SECTION');
+    if (!isUuid(id)) throw new StoreError('معرّف العنصر غير صالح.', 'INVALID_ITEM');
+    const session = await requireSession();
+    const { error } = await supabase
+      .from('items')
+      .delete()
+      .eq('id', id)
+      .eq('user_id', session.user.id);
+    if (error) throwDb(error, 'تعذّر حذف العنصر.');
+    if (section === 'achievements') {
+      const { error: linkError } = await supabase
+        .from('items')
+        .update({ linked_achievement_id: null })
+        .eq('user_id', session.user.id)
+        .eq('linked_achievement_id', id);
+      if (linkError) throwDb(linkError, 'تعذّر تحديث الشواهد المرتبطة بالإنجاز.');
+    }
+    return true;
+  }
+
+  async function addActivity(activity) {
+    const supabase = requireClient();
+    const session = await requireSession();
+    const source = activity && typeof activity === 'object' ? activity : {};
+    const { data, error } = await supabase.from('activity').insert({
+      id: isUuid(source.id) ? source.id : makeUuid(),
+      user_id: session.user.id,
+      kind: cleanText(source.kind, 24) || 'created',
+      section: SECTION_KEYS.includes(source.section) ? source.section : null,
+      title: cleanText(source.title, 140),
+      created_at: normalizeTimestamp(source.at),
+    }).select('*').single();
+    if (error) throwDb(error, 'تعذّر حفظ النشاط.');
+    return rowToActivity(data);
+  }
+
+  async function replaceWorkspace(workspace) {
+    const supabase = requireClient();
+    const session = await requireSession();
+    const source = workspace && typeof workspace === 'object' ? workspace : {};
+    const items = [];
+    SECTION_KEYS.forEach((section) => {
+      (Array.isArray(source[section]) ? source[section] : []).forEach((item) => {
+        items.push({ ...item, section });
+      });
+    });
+    const payload = {
+      profile: source.profile || {},
+      items,
+      activity: Array.isArray(source.activity) ? source.activity.slice(0, 60) : [],
+    };
+    const { error } = await supabase.rpc('replace_workspace', { payload });
+    if (error) {
+      if (/Could not find the function|function .* does not exist/i.test(String(error.message || ''))) {
+        throw new StoreError('دالة replace_workspace غير موجودة. نفّذ ملف supabase/schema.sql كاملًا أولًا.', 'RPC_MISSING');
+      }
+      throwDb(error, 'تعذّر استبدال بيانات المساحة.');
+    }
+    return true;
+  }
+
+  function workspaceBytes(workspace) {
+    return jsonBytes(workspace);
   }
 
   window.AthariStore = {
     StoreError,
-    SESSION_TTL_MS,
     MAX_WORKSPACE_BYTES,
     SECTION_KEYS,
+    isConfigured,
+    configError,
     register,
     login,
     getSession,
-    clearSession,
-    logout: clearSession,
+    onAuthStateChange,
+    logout,
     getWorkspace,
-    saveWorkspace,
+    saveProfile,
+    createItem,
+    updateItem,
+    deleteItem,
+    addActivity,
+    replaceWorkspace,
     workspaceBytes,
     changePassword,
     updateAccountName,
-    accountExists,
-    hasUsers,
     normalizeEmail,
     isValidEmail,
     passwordProblem,
+    makeUuid,
   };
 })();

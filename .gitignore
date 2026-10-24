@@ -2,7 +2,14 @@ node_modules/
 data/
 storage/
 .env
+.env.*
+!.env.example
 *.log
 .runtime/
 .DS_Store
 Thumbs.db
+
+# مفاتيح سرية — لا تُرفع أبدًا
+*service-role*
+*service_role*
+supabase/.temp/
