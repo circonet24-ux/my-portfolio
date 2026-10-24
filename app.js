@@ -1986,14 +1986,16 @@
   }
 
   function sortAttachments(attachments) {
-    return attachments.filter((file) => file && file.dataUrl).map((file) => ({
-      id: file.id || uid(),
-      name: String(file.name || 'ملف مرفق').slice(0, 200),
-      type: String(file.type || 'application/octet-stream'),
-      size: Number(file.size || base64Size(file.dataUrl)),
-      dataUrl: file.dataUrl,
-      createdAt: file.createdAt || new Date().toISOString(),
-    }));
+    return (Array.isArray(attachments) ? attachments : [])
+      .filter((file) => file && /^data:[a-z0-9.+-]+\/[a-z0-9.+-]+;base64,/i.test(String(file.dataUrl || '')))
+      .map((file) => ({
+        id: file.id || uid(),
+        name: String(file.name || 'ملف مرفق').slice(0, 200),
+        type: String(file.type || 'application/octet-stream'),
+        size: Number(file.size || base64Size(file.dataUrl)),
+        dataUrl: file.dataUrl,
+        createdAt: file.createdAt || new Date().toISOString(),
+      }));
   }
 
   /* ------------------------------------------------------------------ */
@@ -3766,7 +3768,7 @@
               <span>لا تضع مفتاح service_role في الواجهة أبدًا. استخدم anon public key فقط.</span>
             </div>
             <ol style="line-height:2;padding-inline-start:22px;margin:18px 0;color:var(--text-2)">
-              <li>أنشئ مشروعًا على supabase.com.</li>
+              <li>أنشئ مشروعًا على <a href="https://supabase.com/dashboard" target="_blank" rel="noopener">supabase.com</a>.</li>
               <li>افتح Project Settings ← API.</li>
               <li>انسخ Project URL و anon public key.</li>
               <li>ضعهما في ملف public/supabase-config.js.</li>
