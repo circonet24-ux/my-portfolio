@@ -1304,7 +1304,7 @@
         ${statCards.map((stat) => {
           const value = stat.section === 'attachments' ? attachments : countSection(stat.section);
           return `
-            <button class="stat-card" type="button" ${stat.section === 'attachments' ? 'data-route="evidence"' : `data-route="${stat.section}"`} aria-label="عرض ${escapeHtml(stat.label)}">
+            <button class="stat-card" type="button" ${stat.section === 'attachments' ? 'data-route="evidence"' : `data-route="${stat.section}"`}>
               <span class="stat-top">
                 <span class="stat-icon ${stat.tone}">${icon(stat.iconName)}</span>
                 <span class="stat-arrow">${icon('chevron-left')}</span>
