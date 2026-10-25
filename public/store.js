@@ -39,6 +39,14 @@
     return '';
   }
 
+  function authRedirectUrl() {
+    if (typeof window === 'undefined' || !window.location) return undefined;
+    const { protocol, origin, pathname } = window.location;
+    if (protocol !== 'http:' && protocol !== 'https:') return undefined;
+    const path = pathname.replace(/index\.html?$/i, '');
+    return origin + (path.endsWith('/') ? path : `${path}/`);
+  }
+
   function cleanText(value, maxLength = 1000) {
     return String(value ?? '').trim().slice(0, maxLength);
   }
@@ -360,10 +368,14 @@
     const passwordError = passwordProblem(password);
     if (passwordError) throw new StoreError(passwordError, 'INVALID_PASSWORD');
 
+    const redirectTo = authRedirectUrl();
     const { data, error } = await supabase.auth.signUp({
       email: cleanEmail,
       password,
-      options: { data: { full_name: cleanName } },
+      options: {
+        data: { full_name: cleanName },
+        ...(redirectTo ? { emailRedirectTo: redirectTo } : {}),
+      },
     });
     if (error) throwAuth(error);
     if (data.user && Array.isArray(data.user.identities) && data.user.identities.length === 0) {
